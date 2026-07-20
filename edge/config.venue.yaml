@@ -1,0 +1,41 @@
+
+talk_id: t_042
+title: "Название доклада из расписания"
+language: ru               
+
+backend: whisper
+model: large-v3
+device: cuda
+compute_type: float16
+beam_size: 1
+chunk_sec: 0.8
+agreement_n: 2             
+no_speech_threshold: 0.65
+
+
+vocabulary:
+  - "Anthropic"
+  - "Whisper"
+  - "LocalAgreement"
+  - "диаризация"
+  - "инференс"
+  - "Мария Петрова"
+
+vad: silero
+vad_threshold: 0.5
+vad_hangover_sec: 0.6
+
+pause_split_sec: 0.6
+max_words: 18
+clause_split_words: 12
+max_segment_sec: 3.5
+
+
+diarize_mode: channel
+diarize_channels: {0: "Мария Петрова", 1: "Иван Соколов", 2: "Модератор"}
+diarize_enroll_dir: "./enroll"     
+diarize_threshold: 0.68
+
+cloud_ws: "wss://captions.example.com/ws/ingest"
+token: "${INGEST_TOKEN}"
+local_stage_port: 8788
