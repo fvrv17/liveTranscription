@@ -1,25 +1,22 @@
 """
-Diarization — who is speaking.
+Диаризация — «кто говорит».
 
-There are two modes, and the choice between them is organizational, not technical:
+Два режима, и выбор между ними — организационный, а не технический:
 
-  mode=channel   Separate channels come from the console (Dante / multi-channel
-                 USB interface, via a loop-through to the panelist). Channel == speaker.
-                 Zero latency, zero errors, works correctly with
-                 interruptions and overlapping speech. THIS IS THE CORRECT SOLUTION
-                 for a panel discussion—insist on it from the organizers.
+  mode=channel   Реализован в channels.py: спикер известен синхронно,
+                 асинхронная диаризация не нужна вовсе.
 
-  mode=embed     Only a master mix is available. ECAPA embedding on a committed
-                 speech segment + online cosine clustering. It cannot
-                 distinguish overlaps at all; it makes mistakes
-                 with short responses (“yes,” “I agree”).
+  mode=embed     Есть только суммарный микс. ECAPA-эмбеддинг на закоммиченном
+                 куске речи + онлайн-кластеризация по косинусу. Overlap не
+                 разбирает в принципе; на коротких репликах («да», «согласен»)
+                 ошибается.
 
-Key techniques that make mode=embed suitable:
-  1. Enrollment during soundcheck: 10 seconds of speech from each panelist -> named
-     centroids. The output is “Maria Petrova,” not “Speaker 2.”
-  2. The speaker tag does NOT block the subtitle. The segment is sent to the audience with spk=null,
-     and the tag arrives as a separate revision after ~200 ms. It’s exactly the same
-     revision mechanism as for partial/final.
+Ключевые приёмы, которые делают mode=embed пригодным:
+  1. Энроллмент на саундчеке: 10 с речи каждого панелиста -> именованные
+     центроиды. На выходе «Мария Петрова», а не «Speaker 2».
+  2. Метка спикера НЕ блокирует субтитр. Сегмент уходит в зал с spk=null,
+     а метка прилетает отдельной ревизией через ~200 мс. Ровно тот же
+     механизм ревизий, что и для partial/final.
 """
 from __future__ import annotations
 
@@ -32,7 +29,8 @@ import numpy as np
 
 log = logging.getLogger("diarize")
 SAMPLE_RATE = 16000
-MIN_EMBED_SEC = 0.8      
+MIN_EMBED_SEC = 0.8      # короче — эмбеддинг бессмысленный
+
 
 @dataclass
 class SpeakerGuess:
@@ -40,21 +38,8 @@ class SpeakerGuess:
     conf: float
 
 
-class ChannelRouter:
-    """mode=channel. Channel Index Mapping -> Speaker ID."""
-
-    def __init__(self, mapping: dict[int, str]):
-        self.mapping = {int(k): v for k, v in mapping.items()}
-
-    def assign_channel(self, ch: int) -> SpeakerGuess:
-        return SpeakerGuess(self.mapping.get(ch, f"ch{ch}"), 1.0)
-
-    def assign(self, audio: np.ndarray) -> SpeakerGuess:      
-        return SpeakerGuess(None, 0.0)
-
-
 class EmbeddingRouter:
-    """mode=embed. Online clustering with optional enrollment."""
+    """mode=embed. Онлайн-кластеризация с опциональным энроллментом."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -68,6 +53,7 @@ class EmbeddingRouter:
         if cfg.diarize_enroll_dir and os.path.isdir(cfg.diarize_enroll_dir):
             self._enroll(cfg.diarize_enroll_dir)
 
+    # -- модель --------------------------------------------------------------
     @property
     def encoder(self):
         if self._encoder is None:
@@ -90,23 +76,25 @@ class EmbeddingRouter:
                 e = self.encoder.encode_batch(t).squeeze().cpu().numpy()
             n = np.linalg.norm(e)
             return e / n if n else None
-        except Exception as exc:                      
+        except Exception as exc:                       # прототип не должен падать из-за диаризации
             log.warning("эмбеддинг не посчитан: %s", exc)
             return None
 
+    # -- энроллмент ----------------------------------------------------------
     def _enroll(self, path: str) -> None:
         for fn in sorted(os.listdir(path)):
             if not fn.lower().endswith(".wav"):
                 continue
-            name = os.path.splitext(fn)[0]           
+            name = os.path.splitext(fn)[0]           # имя файла = имя спикера
             audio = _read_wav(os.path.join(path, fn))
             emb = self.embed(audio)
             if emb is not None:
                 self.centroids[name] = emb
-                self.counts[name] = 8                
+                self.counts[name] = 8                # энроллмент весит больше живых наблюдений
                 self.enrolled.add(name)
-                log.info("enrollment: %s (%.1f c)", name, len(audio) / SAMPLE_RATE)
+                log.info("энроллмент: %s (%.1f c)", name, len(audio) / SAMPLE_RATE)
 
+    # -- назначение ----------------------------------------------------------
     def assign(self, audio: np.ndarray) -> SpeakerGuess:
         emb = self.embed(audio)
         if emb is None:
@@ -119,7 +107,7 @@ class EmbeddingRouter:
                 best, best_sim = spk, sim
 
         if best is not None and best_sim >= self.threshold:
-            if best not in self.enrolled:            
+            if best not in self.enrolled:            # энроллмент-центроиды не размываем
                 n = self.counts[best]
                 upd = (self.centroids[best] * n + emb) / (n + 1)
                 self.centroids[best] = upd / (np.linalg.norm(upd) or 1.0)
@@ -127,12 +115,12 @@ class EmbeddingRouter:
             return SpeakerGuess(best, best_sim)
 
         if len(self.centroids) >= self.max_speakers:
-            return SpeakerGuess(best, best_sim)      
+            return SpeakerGuess(best, best_sim)      # лучше спорная метка, чем бесконечные новые
         self._anon += 1
         spk = f"S{self._anon}"
         self.centroids[spk] = emb
         self.counts[spk] = 1
-        log.info("new speaker: %s (best similarity was %.2f)", spk, best_sim)
+        log.info("новый спикер: %s (лучшее сходство было %.2f)", spk, best_sim)
         return SpeakerGuess(spk, 1.0 - max(best_sim, 0.0))
 
 
@@ -142,8 +130,6 @@ class NullRouter:
 
 
 def build_router(cfg):
-    if cfg.diarize_mode == "channel":
-        return ChannelRouter(cfg.diarize_channels)
     if cfg.diarize_mode == "embed":
         return EmbeddingRouter(cfg)
     return NullRouter()
@@ -160,10 +146,10 @@ def _read_wav(path: str) -> np.ndarray:
 
 class AudioTape:
     """
-    A circular buffer containing the last N seconds of audio.
-    The diary function operates on a segment that has ALREADY been marked, cutting
-    that time interval from the stream—which is why it does not introduce any delay
-    into the main subtitle path.
+    Кольцевой буфер последних N секунд аудио.
+    Диаризация работает по УЖЕ закоммиченному сегменту, вырезая его
+    временной интервал из ленты — поэтому она и не добавляет задержки
+    в основной путь субтитра.
     """
 
     def __init__(self, seconds: float = 120.0):

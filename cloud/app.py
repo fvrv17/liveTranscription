@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Cloud component.
+Облачная часть.
 
-Handles text reception from Edge, translation, fan-out via WebSocket, storage,
-summaries, and the operator console. Audio is not sent here at all—only text is transmitted via
-the site’s unreliable uplink.
+Держит: приём текста от edge, перевод, fan-out по WebSocket, хранилище,
+саммари, пульт оператора. Аудио сюда не приходит принципиально — через
+ненадёжный аплинк площадки идёт только текст.
 
     uvicorn app:app --host 0.0.0.0 --port 8000
 """
@@ -34,14 +34,14 @@ bus = Bus()
 store = Store(os.getenv("DB_PATH", "captions.db"))
 
 glossary = Glossary({
-    # Conference terminology. Do not translate, or translate strictly 
+    # термины конференции: не переводить или переводить строго так
     "Anthropic": {}, "Whisper": {}, "LocalAgreement": {},
     "аплинк": {"en": "uplink"}, "диаризация": {"en": "diarization"},
 })
 translator = Translator(store, bus, glossary)
 summarizer = Summarizer(store)
 
-edge_sockets: dict[str, WebSocket] = {}     # talk_id -> socket edge-agent (for the back commands)
+edge_sockets: dict[str, WebSocket] = {}     # talk_id -> сокет edge-агента (для команд назад)
 health: dict[str, dict] = {}
 
 
@@ -55,9 +55,9 @@ async def on_lang_activated(talk: str, lang: str) -> None:
 bus.on_lang_activated = on_lang_activated
 
 
-
-# received from edge
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Приём от edge
+# ─────────────────────────────────────────────────────────────────────────────
 @app.websocket("/ws/ingest")
 async def ws_ingest(ws: WebSocket):
     auth = ws.headers.get("authorization", "")
@@ -98,7 +98,7 @@ async def handle_edge_message(msg: dict) -> None:
             asyncio.create_task(make_summary(talk))
 
     elif t == "seg":
-        fresh = store.put_segment(msg)          # deduplication of redeliveries
+        fresh = store.put_segment(msg)          # дедуп повторной доставки
         src = msg.get("lang", "ru")
         await bus.publish(topic_seg(talk, src), msg)
         if fresh and msg.get("final") and msg.get("stable"):
@@ -109,8 +109,15 @@ async def handle_edge_message(msg: dict) -> None:
         src = (store.get_talk(talk) or {}).get("src_lang", "ru")
         await bus.publish(topic_seg(talk, src), msg)
 
+    elif t == "floor":
+        # кто держит слово + наложение речи: нужно пульту, в стенограмму не пишется
+        health.setdefault(talk, {})["floor"] = msg
+        await bus.publish(topic_ctl(talk), msg)
+
     elif t in ("health", "state"):
-        health[talk] = {**msg, "at": time.time()}
+        # merge, а не replace: иначе телеметрия затирает последнее известное
+        # состояние владельца слова, приходящее отдельным сообщением
+        health.setdefault(talk, {}).update({**msg, "at": time.time()})
         await bus.publish(topic_ctl(talk), msg)
 
 
@@ -124,9 +131,9 @@ async def make_summary(talk: str) -> None:
     log.info("саммари готово: %s (%d символов)", talk, len(md))
 
 
-
-# viewers
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Зрители
+# ─────────────────────────────────────────────────────────────────────────────
 @app.websocket("/ws/view")
 async def ws_view(ws: WebSocket):
     await ws.accept()
@@ -152,7 +159,7 @@ async def ws_view(ws: WebSocket):
         for t in {topic_seg(talk, lang), topic_seg(talk, src), topic_ctl(talk)}:
             bus.subscribe(t, q)
             subscribed.add(t)
-        # snapshot person who joins in the middle of a presentation can see the context
+        # снапшот: человек, подключившийся в середине доклада, видит контекст
         rows = store.translated_segments(talk, lang)[-40:]
         await ws.send_text(json.dumps({"t": "snapshot", "talk": talk, "lang": lang,
                                        "src_lang": src, "title": info.get("title"),
@@ -160,7 +167,7 @@ async def ws_view(ws: WebSocket):
                                       ensure_ascii=False))
 
     await bus.lang_attach(talk, lang)
-    bus.lang_detach(talk, lang)     # reset the counter the attach command below will increment it again
+    bus.lang_detach(talk, lang)     # выравниваем счётчик, attach ниже поднимет его снова
     await attach(lang)
 
     async def pump():
@@ -172,8 +179,7 @@ async def ws_view(ws: WebSocket):
     try:
         while True:
             data = json.loads(await ws.receive_text())
-            if data.get("t") == "setlang":       # changing the language without reconnecting
-
+            if data.get("t") == "setlang":       # смена языка без переподключения
                 new = data.get("lang", lang)
                 if new != lang:
                     await attach(new)
@@ -186,9 +192,9 @@ async def ws_view(ws: WebSocket):
         bus.lang_detach(talk, lang)
 
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 # REST
-
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/api/langs")
 def api_langs():
     return LANGS

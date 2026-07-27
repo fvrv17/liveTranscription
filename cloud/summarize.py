@@ -1,14 +1,14 @@
 """
-Presentation Summary.
+Саммари доклада.
 
-It is based on a transcript from the repository (rather than generated on the fly), so:
-  * We split a long presentation into segments and perform a map-reduce;
-  * If there was a diary-style transcript, we count the remarks by speaker and create a Q&A section;
-  * if there are no keys—we use extractive fallback so the prototype works offline.
+Строится на транскрипте из хранилища (а не на лету), поэтому:
+  * длинный доклад режем на окна и делаем map-reduce;
+  * если была диаризация — считаем реплики по спикерам и делаем секцию Q&A;
+  * если ключей нет — экстрактивный фолбэк, чтобы прототип работал офлайн.
 
-It’s important to note what’s often overlooked: LLMs hallucinate NUMBERS. Therefore, the prompt explicitly prohibits
-numbers that aren’t in the transcript, and in the UI, the summary is marked as a draft
-until confirmed by an operator.
+Важно, что упускают: LLM галлюцинирует ЦИФРЫ. Поэтому в промпте явный запрет
+на числа, которых нет в транскрипте, а в UI саммари помечено как черновик
+до подтверждения оператором.
 """
 from __future__ import annotations
 

@@ -1,9 +1,13 @@
 """
-Pub/Sub + active language registry.
+Pub/Sub + реестр активных языков.
 
-In the prototype, it is in-process (asyncio). The interface is intentionally identical to NATS/Redis
-Streams: publish(topic, msg) / subscribe(topic) → async iterator, so that switching
-to a real broker when scaling to multiple halls is a straightforward process.
+В прототипе — in-process (asyncio). Интерфейс намеренно совпадает с NATS/Redis
+Streams: publish(topic, msg) / subscribe(topic) -> async iterator, чтобы замена
+на реальный брокер при масштабировании на несколько залов была механической.
+
+Реестр языков — это то, на чём экономятся основные деньги: переводим только
+те языки, которые кто-то реально слушает. Из 12 предложенных в UI активными
+на докладе обычно оказываются 2-3.
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ class Bus:
     def __init__(self):
         self._subs: dict[str, set[asyncio.Queue]] = defaultdict(set)
         self._lang_counts: dict[tuple[str, str], int] = defaultdict(int)
-        self.on_lang_activated = None      # callback: language became in demand
+        self.on_lang_activated = None      # колбэк: язык стал востребован
 
     async def publish(self, topic: str, msg: dict) -> None:
         for q in list(self._subs.get(topic, ())):
@@ -37,7 +41,7 @@ class Bus:
         if not self._subs[topic]:
             self._subs.pop(topic, None)
 
-    # -- language tracking 
+    # -- учёт языков ---------------------------------------------------------
     async def lang_attach(self, talk: str, lang: str) -> None:
         key = (talk, lang)
         self._lang_counts[key] += 1

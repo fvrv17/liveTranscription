@@ -1,11 +1,12 @@
 """
-Transcript Storage.
+Хранилище транскриптов.
 
-SQLite is sufficient for a prototype. Deduplication by (talk, sid): an incoming revision overwrites
-the previous one, so redelivery after the uplink reconnects is safe.
+SQLite достаточно для прототипа и для одного зала: запись — десятки строк
+в минуту. Дедупликация по (talk, sid): приходящая ревизия перезаписывает
+предыдущую, поэтому повторная доставка после реконнекта аплинка безопасна.
 
-Along with the text, we store the average ASR confidence per segment: this shows
-which parts of the presentation the model struggled with.
+Вместе с текстом храним среднюю уверенность ASR по сегменту: по ней видно,
+на каких участках доклада модель плыла.
 """
 from __future__ import annotations
 
@@ -42,13 +43,13 @@ class Store:
             self.db.executescript(SCHEMA)
             self.db.commit()
 
-    # -- reports 
+    # -- доклады -------------------------------------------------------------
     def upsert_talk(self, talk: str, **kw) -> None:
         with self.lock:
             self.db.execute("INSERT OR IGNORE INTO talks(talk, started, state) VALUES(?,?,?)",
                             (talk, time.time(), "live"))
             for k, v in kw.items():
-                if v is None:                     # partial update should not overwrite the fields
+                if v is None:                     # частичное обновление не должно затирать поля
                     continue
                 if k in ("title", "src_lang", "state", "summary", "ended"):
                     self.db.execute(f"UPDATE talks SET {k}=? WHERE talk=?", (v, talk))
@@ -65,9 +66,9 @@ class Store:
                                    "ORDER BY started DESC").fetchall()
         return [dict(r) for r in rows]
 
-    # -- segments 
+    # -- сегменты ------------------------------------------------------------
     def put_segment(self, m: dict) -> bool:
-        """Returns False if an outdated revision was received (duplicate after reconnect)."""
+        """Возвращает False, если пришла устаревшая ревизия (дубль после реконнекта)."""
         with self.lock:
             cur = self.db.execute("SELECT rev FROM segments WHERE talk=? AND sid=?",
                                   (m["talk"], m["sid"])).fetchone()
@@ -114,7 +115,7 @@ class Store:
             rows = self.db.execute(q, (talk, since_sid)).fetchall()
         return [dict(r) for r in rows]
 
-    # -- translations 
+    # -- переводы ------------------------------------------------------------
     def get_translation(self, talk: str, sid: int, lang: str, rev: int) -> str | None:
         with self.lock:
             r = self.db.execute("SELECT rev,text FROM translations WHERE talk=? AND sid=? AND lang=?",

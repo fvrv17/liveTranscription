@@ -1,16 +1,16 @@
 """
-Translation.
+Перевод.
 
-Three rules, each of which directly affects the cost and the UX:
+Три правила, каждое из которых напрямую влияет на счёт и на UX:
 
-  1. We translate ONLY final && stable segments. Translating partial segments is
-     significantly more expensive and causes the text to “jump” on the screen: MT rewrites the entire phrase starting from
-     a single new word.
-  2. Translate ONLY languages that have an active subscriber (bus.active_langs).
-     Out of 12 languages in the UI, usually 2–3 are active—this reduces the cost by a factor of 4–6.
-  3. Cache by (talk, sid, lang) and glossary. Conference terms are protected
-     by placeholders until translation and restored afterward—otherwise, MT will translate
-     the product name.
+  1. Переводим ТОЛЬКО final && stable сегменты. Перевод partial-гипотез стоит
+     в разы дороже и на экране «дёргается»: MT переписывает всю фразу от
+     одного нового слова.
+  2. Переводим ТОЛЬКО языки, у которых есть живой подписчик (bus.active_langs).
+     Из 12 языков в UI активны обычно 2-3 — счёт падает в 4-6 раз.
+  3. Кэш по (talk, sid, lang) и глоссарий. Термины конференции защищаются
+     плейсхолдерами до перевода и возвращаются после — иначе MT переведёт
+     название продукта.
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class Glossary:
     """Термины, которые нельзя переводить и нельзя коверкать."""
 
     def __init__(self, terms: dict[str, dict[str, str]] | None = None):
-        # {“original term”: {“en”: “Term”, ‘de’: “Term”}}; empty dictionary => do not translate
+        # {"термин в оригинале": {"en": "Term", "de": "Term"}}; пустой словарь => не переводить
         self.terms = terms or {}
         self._re = self._compile()
 
@@ -60,6 +60,7 @@ class Glossary:
         return text
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 class DeepLEngine:
     def __init__(self, key: str):
         self.key = key
@@ -110,6 +111,7 @@ def build_engine():
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 class Translator:
     def __init__(self, store, bus, glossary: Glossary | None = None, concurrency: int = 6):
         self.store = store
@@ -153,7 +155,7 @@ class Translator:
         except Exception as exc:
             self.stats["errors"] += 1
             log.warning("перевод %s->%s не удался: %s", src, tgt, exc)
-            return                       # degradation: the user will see the original, not a blank space
+            return                       # деградация: клиент увидит оригинал, а не пустоту
         out = self.glossary.restore(out, found, tgt)
         self.store.put_translation(talk, sid, rev, tgt, out)
         if publish:

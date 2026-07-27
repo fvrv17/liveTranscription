@@ -24,9 +24,11 @@ import numpy as np
 
 from asr import StreamingASR, WhisperBackend, SAMPLE_RATE
 from audio import FRAME, VAD, FileSource, MicSource
+from channels import FloorDetector
 from config import Config
 from diarize import AudioTape, SpeakerGuess, build_router
 from segmenter import Segmenter
+from timebase import TimeMap
 from uplink import Uplink
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)-9s %(levelname)-7s %(message)s")
@@ -110,8 +112,14 @@ class Edge:
         self.backend = WhisperBackend(cfg)
         self.asr = StreamingASR(self.backend, cfg)
         self.seg = Segmenter(cfg)
-        self.vad = VAD(cfg) if cfg.vad != "off" else None
+        self.timemap = TimeMap()
         self.tape = AudioTape(120.0)
+
+        # В канальном режиме владелец слова сам работает детектором речи:
+        # никто не говорит — значит, кормить ASR нечем. Отдельный VAD не нужен.
+        self.floor = (FloorDetector(cfg, cfg.diarize_channels, cfg.channels)
+                      if cfg.diarize_mode == "channel" else None)
+        self.vad = VAD(cfg) if (cfg.vad != "off" and self.floor is None) else None
         self.router = build_router(cfg)
         self.stage = LocalStage(cfg.local_stage_port)
         self.uplink = Uplink(cfg.cloud_ws, cfg.token)
@@ -150,6 +158,7 @@ class Edge:
         text = s.text
         if not text:
             return
+        t0_abs, t1_abs = self.timemap.span_abs(s.t0, s.t1)
         await self.emit({
             "t": "seg", "sid": s.sid, "rev": s.rev,
             "final": s.final, "stable": ev.stable,
@@ -158,29 +167,51 @@ class Edge:
             "text": text + ((" " + ev.partial_tail) if ev.partial_tail else ""),
             "stable_len": len(text),          # всё правее — нестабильный хвост гипотезы
             "conf": round(s.conf, 3),
-            "t0": round(s.t0, 2), "t1": round(s.t1, 2),
+            # наружу — абсолютное время доклада, а не часы ASR (см. timebase.py)
+            "t0": round(t0_abs, 2), "t1": round(t1_abs, 2),
         })
-        if s.final and self.cfg.diarize_mode != "off":
-            await self.diar_q.put(s)
+        # в канальном режиме спикер уже проставлен синхронно, догонять нечего
+        if s.final and self.cfg.diarize_mode == "embed":
+            await self.diar_q.put((s, t0_abs, t1_abs))
 
     # -- диаризация вне критического пути ------------------------------------
     async def diarizer(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
-            s = await self.diar_q.get()
-            audio = self.tape.slice(s.t0, s.t1)
+            s, t0_abs, t1_abs = await self.diar_q.get()
+            audio = self.tape.slice(t0_abs, t1_abs)     # лента живёт в абсолютном времени
             guess = await loop.run_in_executor(None, self.router.assign, audio)
             if guess.spk and guess.spk != s.spk:
                 s.spk, s.spk_conf, s.rev = guess.spk, guess.conf, s.rev + 1
                 await self.emit({"t": "spk", "sid": s.sid, "rev": s.rev,
                                  "spk": guess.spk, "spk_conf": round(guess.conf, 2)})
 
+    # -- смена владельца слова -----------------------------------------------
+    async def on_floor(self, ev) -> None:
+        """Порядок важен: сначала добираем хвост ПРЕДЫДУЩЕГО спикера,
+        затем закрываем его сегмент, и только потом переключаем имя."""
+        tail = self.asr.hard_reset(self.timemap.speech_clock)
+        for e in self.seg.push_stable(tail):
+            await self.emit_seg(e)
+        e = self.seg.flush()
+        if e:
+            await self.emit_seg(e)
+
+        self.seg.set_speaker(ev.owner)
+        if ev.overlap:
+            log.warning("наложение речи: %s поверх %s", ", ".join(ev.overlap), ev.owner)
+        await self.emit({"t": "floor", "owner": ev.owner, "channel": ev.channel,
+                         "overlap": ev.overlap, "at": round(ev.t, 2)})
+
     # -- телеметрия ----------------------------------------------------------
     async def health(self) -> None:
         while True:
             await asyncio.sleep(2)
+            extra = self.floor.status() if self.floor else {}
             await self.emit({"t": "health",
                              "lag_ms": round(self.lag_ms),
+                             "silence_dropped": round(self.timemap.silence_dropped, 1),
+                             **extra,
                              "uplink": "ok" if self.uplink.healthy else "down",
                              "pending": len(self.uplink.pending),
                              "dropped": self.uplink.dropped,
@@ -191,7 +222,8 @@ class Edge:
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue(maxsize=400)
         stop = threading.Event()
-        source = FileSource(self.cfg.audio_file) if self.cfg.audio_file else MicSource()
+        source = (FileSource(self.cfg.audio_file) if self.cfg.audio_file
+                  else MicSource(channels=self.cfg.channels))
         threading.Thread(target=capture_thread, args=(source, loop, q, stop), daemon=True).start()
 
         await self.emit({"t": "talk", "state": "live", "title": self.cfg.title,
@@ -209,12 +241,26 @@ class Edge:
                     if isinstance(source, FileSource):
                         break
                 else:
+                    block = frame if frame.ndim > 1 else frame.reshape(-1, 1)
                     t_abs = self.samples / SAMPLE_RATE
-                    self.samples += len(frame)
-                    self.tape.write(frame, t_abs)
-                    speech = self.vad.is_speech(frame) if self.vad else True
-                    if speech:
-                        self.asr.feed(frame)   # тишину в Whisper не отдаём — галлюцинирует
+                    self.samples += len(block)
+                    # Лента пишется ЦЕЛИКОМ и в абсолютном времени: по ней режет
+                    # диаризация, и пропуски сделали бы её координаты враньём.
+                    self.tape.write(block.mean(axis=1), t_abs)
+
+                    if self.floor is not None:
+                        fev = self.floor.push(block, t_abs)
+                        if fev:
+                            await self.on_floor(fev)
+                        pcm = self.floor.asr_input(block)
+                    else:
+                        pcm = block.mean(axis=1)
+                        if self.vad and not self.vad.is_speech(pcm):
+                            pcm = None
+
+                    if pcm is not None:
+                        self.timemap.feed(len(pcm), t_abs)
+                        self.asr.feed(pcm)     # тишину в Whisper не отдаём — галлюцинирует
 
                 if self.asr.ready():
                     t_start = time.monotonic()

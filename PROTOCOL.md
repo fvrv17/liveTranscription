@@ -1,59 +1,66 @@
-# Subtitle Protocol
+# Протокол субтитров
 
-One rule from which everything else follows:
-**A segment is a mutable entity with a version, not a string in an append-only log.**
+Одно правило, из которого следует всё остальное:
+**сегмент — это изменяемая сущность с версией, а не строка в append-only логе.**
 
-ASR partial hypotheses, late speaker tags, manual editor corrections, and translation arrivals—
-all of these are revisions of the same `sid`. The client stores a `Map<sid, segment>` and performs an upsert.
+Partial-гипотезы ASR, поздняя метка спикера, ручная правка оператора и приход перевода —
+всё это ревизии одного и того же `sid`. Клиент хранит `Map<sid, segment>` и делает upsert.
 
-## Segment Message
+## Сообщение сегмента
 
 ```jsonc
 {
-  “t”: “seg”,
-  “sid”: 128,          // segment ID, monotonically increasing within `talk_id`
-  “rev”: 3,            // version; the client ignores `rev` <= a version that has already been applied
-  “talk”: “t_042”,
-  “final”: false,      // false = ASR may still overwrite the text
-  “stable”: true,      // text has been committed to LocalAgreement; can be translated
-  “lang”: “ru”,        // language of THIS text
-  “spk”: “s_maria”,    // null until diacritization has responded
-  “spk_conf”: 0.81,
-  “text”: “We measured latency at three sites.”,
-  “conf”: 0.91,        // average ASR confidence per segment
-  “t0”: 412.30,        // seconds from the start of the presentation
-  “t1”: 415.10,
-  “emitted_at”: 1721471234.512  // Unix timestamp at the edge, for measuring end-to-end latency
+  "t": "seg",
+  "sid": 128,          // id сегмента, монотонный в рамках talk_id
+  "rev": 3,            // версия; клиент игнорирует rev <= уже применённого
+  "talk": "t_042",
+  "final": false,      // false = ASR ещё может переписать текст
+  "stable": true,      // текст закоммичен LocalAgreement; можно переводить
+  "lang": "ru",        // язык ЭТОГО текста
+  "spk": "s_maria",    // null, пока диаризация не ответила
+  "spk_conf": 0.81,
+  "text": "Мы измеряли задержку на трёх площадках.",
+  "conf": 0.91,        // средняя уверенность ASR по сегменту
+  "t0": 412.30,        // сек от начала доклада, АБСОЛЮТНЫХ (не часы ASR)
+  "t1": 415.10,
+  "emitted_at": 1721471234.512  // unix ts на edge, для измерения сквозной задержки
 }
 ```
 
-### Why `final` and `stable` Are Different Flags
+### Почему `final` и `stable` — разные флаги
 
-| stable | final | what it is | show | translate |
+| stable | final | что это | показывать | переводить |
 |---|---|---|---|---|
-| false | false | “tail” of the hypothesis, words are still fluctuating | yes, muted | **no** |
-| true | false | prefix committed, sentence not closed | yes, in full contrast | no |
-| true | true | segment closed (punctuation/pause/limit) | yes | **yes** |
+| false | false | «хвост» гипотезы, слова ещё пляшут | да, приглушённо | **нет** |
+| true | false | префикс закоммичен, предложение не закрыто | да, полным контрастом | нет |
+| true | true | сегмент закрыт (пунктуация/пауза/лимит) | да | **да** |
 
-Translation starts exactly at the transition to `stable && final`. This is the answer to “translation is jerky and expensive.”
+Перевод запускается ровно на переходе в `stable && final`. Это и есть ответ на «перевод дёргается и стоит дорого».
 
-## Other messages
+## Прочие сообщения
+
+Про `t0`/`t1`: в ASR попадает только речь, поэтому его внутренние часы идут
+медленнее реального времени — на суммарную длительность пауз. Наружу и в ленту
+аудио уходит абсолютное время доклада; перевод одного в другое — `edge/timebase.py`.
+Путать эти шкалы нельзя: расхождение молчаливое и растёт весь доклад.
 
 ```jsonc
-{“t”:“tr”,“sid”:128,“rev”:3,“lang”:“en”,‘text’:“We measured latency at three venues.”}
-{“t”:“spk”,“sid”:128,“rev”:4,“spk”:‘s_maria’,“spk_conf”:0.81}  // late diarization
-{“t”:“talk”,“talk”:“t_042”,“state”:“live”,‘title’:“...”," speakers“:[...],‘src_lang’:”ru"}
-{“t”:‘state’,“muted”:true}          // operator kill switch
-{“t”:“health”,“asr_rtf”:0.42,“lag_ms”:1840,“uplink”:‘ok’,“dropped”:0}
-{“t”:“summary”,“talk”:“t_042”,‘md’:“...”}
-{“t”:“hello”,“talk”:“t_042”,“lang”:‘en’,“from_sid”:110}  // client → server upon (re)connection
+{"t":"tr","sid":128,"rev":3,"lang":"en","text":"We measured latency at three venues."}
+{"t":"spk","sid":128,"rev":4,"spk":"s_maria","spk_conf":0.81}  // поздняя диаризация
+{"t":"talk","talk":"t_042","state":"live","title":"...","speakers":[...],"src_lang":"ru"}
+{"t":"state","muted":true}          // kill switch оператора
+{"t":"health","lag_ms":1840,"uplink":"ok","dropped":0,"silence_dropped":312.5,
+ "owner":"Мария Петрова","channels":[{"name":"Мария Петрова","snr":21.4,"dead":false}]}
+{"t":"floor","owner":"Иван Соколов","channel":1,"overlap":["Мария Петрова"],"at":412.3}
+{"t":"summary","talk":"t_042","md":"..."}
+{"t":"hello","talk":"t_042","lang":"en","from_sid":110}  // клиент → сервер при (пере)подключении
 ```
 
-## Delivery Guarantees
+## Гарантии доставки
 
-Edge → cloud: Each message has a `seq` (monotonic). The cloud acknowledges `{“t”:‘ack’,“seq”:N}`.
-The edge stores unacknowledged messages in a circular buffer (default: 5,000 messages ≈ 40 minutes of text)
-and, upon reconnection, resends starting from `last_ack+1`. The cloud deduplicates based on `(sid, rev)`.
+Edge → cloud: у каждого сообщения `seq` (монотонный). Cloud подтверждает `{"t":"ack","seq":N}`.
+Edge держит неподтверждённые в кольцевом буфере (по умолчанию 5000 сообщений ≈ 40 мин текста)
+и при реконнекте досылает с `last_ack+1`. Cloud дедуплицирует по `(sid, rev)`.
 
-Cloud → client: The client sends `from_sid` in the `hello` message—the server returns a snapshot of the last
-N segments, then switches to live mode. A 10-second Wi-Fi outage in the room does not result in text loss.
+Cloud → клиент: клиент в `hello` присылает `from_sid` — сервер отдаёт снапшот последних
+N сегментов, затем переходит в live. Обрыв Wi-Fi в зале на 10 секунд не теряет текст.

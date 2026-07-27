@@ -1,189 +1,236 @@
-# Live Conference Subtitles 
+# Живые субтитры конференции — бэкенд
 
-Real-time speech recognition of the speaker, translation into any language,
-and a summary at the end of the presentation. Limit: 5 seconds of end-to-end latency.
+Распознавание речи спикера в реальном времени, перевод на произвольный язык,
+саммари в конце доклада. Ограничение — 5 секунд сквозной задержки.
 
-This covers only the server-side components: the venue agent, the cloud service, and the protocol between
-them. Clients (the screen in the hall, the viewer’s web interface, the operator’s console) are consumers of the
-WebSocket API and are not included in this repository.
+Здесь только серверная часть: агент площадки, облачный сервис и протокол между
+ними. Клиенты (экран в зале, веб-интерфейс зрителя, пульт оператора) — потребители
+WebSocket API, в этот репозиторий не входят.
 
-## System Architecture
+## Разрез системы
 
-The boundary lies **between audio and text**, not between the front end and the back end.
+Граница проходит **между аудио и текстом**, а не между фронтом и бэком.
 
 ```
-STAGE (sound engineer’s GPU box)      CLOUD
-┌────────────────────────────────┐        ┌───────────────────────── ─────┐
-│ control panel ─► ingest ─► VAD ─► ASR  │ text  │ translation ─► pub/sub ─► WS     │──► viewers
-│              │       │         │ ~2 kbit │ storage ─► summaries         │
-│              │       └► segmenter ───►│ operator API                │
-│              └► diarization     │        └──────────────────────────────┘
+ПЛОЩАДКА (GPU-бокс у звукорежиссёра)      ОБЛАКО
+┌────────────────────────────────┐        ┌──────────────────────────────┐
+│ пульт ─► ingest ─► VAD ─► ASR  │ текст  │ перевод ─► pub/sub ─► WS     │──► зрители
+│              │       │         │ ~2кбит │ хранилище ─► саммари         │
+│              │       └► сегментатор ───►│ API оператора                │
+│              └► диаризация     │        └──────────────────────────────┘
 │                                │
-│   ws://:8788 (hall screen) ◄────┤  local socket, independent of the uplink
+│   ws://:8788 (экран зала) ◄────┤  локальный сокет, не зависит от аплинка
 └────────────────────────────────┘
 ```
 
-Three consequences:
+Три следствия:
 
-1. **Audio does not leave the room.** Only text is transmitted via the venue’s unreliable uplink:
-   ~2 kbps instead of 48. Text can be buffered and resent, but the audio stream cannot.
-2. **The screen in the room experiences an internet outage.** It relies on the agent’s local socket.
-   Verified: the cloud went down for 8 seconds in the middle of a presentation—the local circuit
-   didn’t notice it; 76 accumulated messages were delivered after recovery,
-   and duplicates were filtered out based on `(sid, rev)`.
-3. **Audience members are not connected to the venue’s Wi-Fi.** Client traffic goes to the cloud, so
-   an overloaded access point doesn’t bring down the entire system.
+1. **Аудио не покидает зал.** Через ненадёжный аплинк площадки идёт только текст:
+   ~2 кбит/с вместо 48. Текст можно буферизовать и дослать, аудиопоток — нет.
+2. **Экран в зале переживает обрыв интернета.** Он висит на локальном сокете
+   агента. Проверено: облако убито на 8 секунд посреди доклада — локальный контур
+   не заметил, 76 накопленных сообщений доехали после восстановления,
+   дубли отсеклись по `(sid, rev)`.
+3. **Зрители не сидят на Wi-Fi зала.** Клиентский трафик идёт в облако, поэтому
+   перегруженная точка доступа не выносит систему целиком.
 
-If there’s only one venue and the internet connection is reliable—everything is consolidated into a single server, and that’s
-a perfectly fine solution. A hybrid setup is needed when there are multiple venues or the connection is hit-or-miss.
+Если зал один и интернет надёжный — всё схлопывается в один сервер, и это
+нормальное решение. Гибрид нужен там, где залов несколько или связь — лотерея.
 
-## What’s non-trivial here
+## Что здесь нетривиального
 
-**Segment revisions instead of an append-only log.** The same `sid` is overwritten by
-four independent sources: ASR stabilization, late diarization, arrival of
-translations, and manual operator edits. All four rely on a single mechanism—but only
-because it was in the protocol from the very beginning. The format is in `PROTOCOL.md`.
+**Ревизии сегментов вместо append-only лога.** Один и тот же `sid` переписывают
+четыре независимых источника: стабилизация ASR, поздняя диаризация, приход
+перевода, ручная правка оператора. Все четыре легли на один механизм — но только
+потому, что он был в протоколе с самого начала. Формат — в `PROTOCOL.md`.
 
-**`final` and `stable` are different flags.** There is a state where “the prefix is committed,
-but the sentence isn’t closed yet”: it’s already possible to return the text to the client as confirmed,
-but it’s not yet possible to translate it. Translation starts exactly when the status transitions to `stable && final`.
-Without this distinction, either the contrast between hypothesis and fact is lost,
-or the MT stutters and rewrites the phrase starting with every new word.
+**`final` и `stable` — разные флаги.** Есть состояние «префикс закоммичен,
+предложение ещё не закрыто»: отдавать клиенту как подтверждённый текст уже можно,
+переводить — ещё нельзя. Перевод стартует ровно на переходе в `stable && final`.
+Без этого разделения либо теряется контраст между гипотезой и фактом,
+либо MT дёргается и переписывает фразу от каждого нового слова.
 
-**LocalAgreement-N.** A word is committed when it has matched in the last N hypotheses.
-This costs exactly +1 chunk of delay and is the main control knob for “stability versus
-speed” (`agreement_n`).
+**LocalAgreement-N.** Слово коммитим, когда оно совпало в N последних гипотезах.
+Это стоит ровно +1 чанк задержки и является главной ручкой «стабильность против
+скорости» (`agreement_n`).
 
-**Diaryization outside the critical path.** A segment leaves with `spk: null`; the label
-arrives in the next revision after ~200 ms. `channel` mode (separate channels
-from the console) is more accurate and faster than any ML—if the organizers provide a multi-channel
-input, you should use it: it handles interruptions and overlap correctly, which online
-embedding clustering cannot do in principle. Enrollment during soundcheck
-(10 seconds per panelist) provides names instead of “Speaker 2.”
+**Определение говорящего по каналам.** Если с пульта идут раздельные каналы
+(Dante, многоканальный интерфейс, по петличке на панелиста) — это точнее и
+быстрее любого ML: спикер известен синхронно, задержки ноль, перебивания и
+наложение обрабатываются корректно. Наивная реализация «побеждает самый
+громкий канал» не работает по трём причинам, и `edge/channels.py` написан
+вокруг них:
 
-**Lazy translation.** We only translate languages that have an active subscriber.
-Out of about fifteen languages in the interface, usually 2–3 are active—MT usage drops
-by a factor of 4–6. When a new language is activated, we catch up on the last 30 segments.
+- **Просочка.** Спикер за трибуной слышен во всех микрофонах сцены, просто
+  тише. Активных каналов всегда несколько. Отличаем просочку от настоящего
+  наложения по корреляции огибающих: просочка — ослабленная копия лидера
+  и идёт синхронно с ним, второй голос — нет.
+- **Разный гейн.** Петличка и трибунный отличаются на 10–15 dB. Поэтому все
+  пороги считаются от **шумового пола канала**, который отслеживается
+  адаптивно (к тишине падает быстро, вверх ползёт еле-еле, чтобы длинная
+  реплика не утащила его за собой).
+- **Дребезг.** Между словами уровень проваливается. Выдержка на переход
+  (150 мс) гасит кашель и стук, выдержка на отпускание (700 мс) не даёт
+  паузе между словами отнять слово.
 
-**Anti-hallucination measures.** During silence, Whisper confidently outputs “Subtitles created…”
-or “To be continued…”—on the screen behind the speaker, this is an incident.
-Three filters: a VAD gate before ASR, the `no_speech_prob` threshold, a phrase blocklist, plus
-a detector for degenerate decoder repetitions.
+Побочно это ещё и VAD: никто не держит слово — значит, речи нет. Плюс
+детектор мёртвого канала: выключенная петличка или севшая батарейка видны
+оператору до того, как спикер начнёт говорить в неё.
 
-**Conference vocabulary.** Speaker names, product names, abbreviations—
-exactly the words people came to hear, and these are the ones that break down without
-`vocabulary` (hotwords for ASR) and the glossary for MT.
+Смена владельца слова принудительно закрывает сегмент и жёстко сбрасывает
+буфер ASR — иначе гипотеза склеит двух говорящих, а `initial_prompt` от
+предыдущего спикера потянет распознавание не туда.
 
-## Latency Budget
+**Диаризация по эмбеддингам** (`embed`) — запасной путь, когда есть только
+суммарный микс. Метка приезжает отдельной ревизией через ~200 мс и не
+задерживает субтитр. Энроллмент на саундчеке (10 секунд на панелиста)
+даёт имена вместо «Speaker 2». Наложение речи не разбирает в принципе.
 
-| Component | Original | Translation |
+**Две шкалы времени.** В ASR попадает только речь, поэтому его часы идут
+медленнее реального времени ровно на суммарную длительность пауз. Лента аудио
+для диаризации, таймкоды протокола и архивная стенограмма живут в абсолютном
+времени доклада. Перевод между шкалами — `edge/timebase.py`. Смешивать их
+нельзя: расхождение молчаливое, ничего не падает, просто диаризация начинает
+резать чужой кусок аудио, а таймкоды врут тем сильнее, чем дольше доклад.
+
+**Ленивый перевод.** Переводим только языки, у которых есть живой подписчик.
+Из полутора десятков языков в интерфейсе активны обычно 2–3 — расход MT падает
+в 4–6 раз. При активации нового языка догоняем последние 30 сегментов.
+
+**Антигаллюцинации.** Whisper на тишине уверенно выдаёт «Субтитры сделал…»,
+«Продолжение следует…» — на экране за спиной у спикера это инцидент.
+Три фильтра: VAD-гейт до ASR, порог `no_speech_prob`, блоклист фраз плюс
+детектор вырожденных повторов декодера.
+
+**Словарь конференции.** Имена докладчиков, названия продуктов, аббревиатуры —
+ровно те слова, ради которых пришли слушать, и именно они ломаются без
+`vocabulary` (hotwords для ASR) и глоссария для MT.
+
+## Бюджет задержки
+
+| Звено | Оригинал | Перевод |
 |---|---|---|
-| capture + chunk buffer | 500–900 ms | same |
-| ASR inference (large-v3, GPU) | 250–600 ms | same |
-| **LocalAgreement stabilization (+1 chunk)** | 500–900 ms | same |
-| waiting for sentence boundary | — | 0–3500 ms |
-| text uplink | — | 30–80 ms |
-| MT | — | 100–600 ms |
-| pub/sub + WS | 60–150 ms | same |
-| **total** | **1.3–2.2 s** | **2.2–5.0 s** |
+| захват + буфер чанка | 500–900 мс | то же |
+| инференс ASR (large-v3, GPU) | 250–600 мс | то же |
+| **стабилизация LocalAgreement (+1 чанк)** | 500–900 мс | то же |
+| ожидание границы предложения | — | 0–3500 мс |
+| аплинк текста | — | 30–80 мс |
+| MT | — | 100–600 мс |
+| pub/sub + WS | 60–150 мс | то же |
+| **итого** | **1.3–2.2 с** | **2.2–5.0 с** |
 
-A subtle point that determines the configuration: `max_segment_sec` **does not** add delay
-to the original subtitles—they grow in segments as recognition progresses. It affects
-only the translation, and only the **first words** of a phrase: the last word
-is translated almost immediately after it is spoken. Therefore, the “5-second” worst-case scenario refers
-to the start of a long sentence in the translation, and this is precisely what conflicts
-with the requirement.
+Тонкость, определяющая настройку: `max_segment_sec` **не** добавляет задержки
+оригинальным субтитрам — они растут партиалами по мере распознавания. Он влияет
+только на перевод, и только на **первые слова** фразы: последнее слово
+переводится почти сразу после произнесения. Поэтому worst case «5 секунд» —
+это про начало длинного предложения в переводе, и именно это упирается
+в требование.
 
-If we don’t meet the deadline: `agreement_n: 1` reduces the delay by ~800 ms at the cost of text stability;
-switching from Whisper to a transducer model (Parakeet, Deepgram) saves another ~500 ms
-on segment size. Reducing `max_segment_sec` is a last resort; it directly
-worsens MT quality: short clauses are translated noticeably worse than full sentences.
+Если не укладываемся: `agreement_n: 1` снимает ~800 мс ценой стабильности текста;
+переход с Whisper на transducer-модель (Parakeet, Deepgram) снимает ещё ~500 мс
+на размере чанка. Резать `max_segment_sec` — последнее средство, оно напрямую
+ухудшает MT: короткие клаузы переводятся заметно хуже целых предложений.
 
-## Hardware and Money
+## Железо и деньги
 
-**On-premises, one hall:** An RTX 4070 / L4 is sufficient for one large-v3 stream;
-an RTX 4090 can handle 2–3 halls. 8-core CPU, 32 GB RAM.
-**Cloud:** 4 vCPUs / 8 GB can handle about 10,000 WS connections.
+**Площадка, один зал:** RTX 4070 / L4 хватает для одного потока large-v3,
+RTX 4090 тянет 2–3 зала. CPU 8 ядер, 32 ГБ RAM.
+**Облако:** 4 vCPU / 8 ГБ держит порядка 10 000 WS-соединений.
 
-Cost for an 8-hour day, one hall: API translation is the most expensive line item
-and the only one that scales linearly with the number of languages (about a hundred dollars a day
-for 10 languages with constant speech input). Lazy translation cuts this by a factor of three to four.
-A local MT model eliminates this cost entirely at the expense of one additional GPU.
+Расход на 8-часовой день, один зал: перевод через API — самая дорогая строка
+и единственная, растущая линейно по числу языков (порядка сотни долларов в день
+на 10 языков при постоянной речи). Ленивый перевод срезает это втрое-вчетверо.
+Локальная MT-модель убирает строку целиком ценой ещё одного GPU.
 
 ## API
 
-**Ingest from the platform:** `ws://…/ws/ingest` (Bearer token). At-least-once
-with acknowledgment via `seq`; the agent holds unacknowledged messages in a circular buffer
-(5,000 messages ≈ 40 minutes of speech) and resends them upon reconnection. The server deduplicates
-by `(sid, rev)`.
+**Приём с площадки:** `ws://…/ws/ingest` (Bearer-токен). At-least-once
+с подтверждением по `seq`; агент держит неподтверждённые в кольцевом буфере
+(5000 сообщений ≈ 40 минут речи) и досылает при реконнекте. Сервер дедуплицирует
+по `(sid, rev)`.
 
-**Delivery to clients:** `ws://…/ws/view?talk=…&lang=…`. Upon connection—a snapshot
-of the last 40 segments, then live streaming. Change language with a `setlang` message
-without reconnecting.
+**Раздача клиентам:** `ws://…/ws/view?talk=…&lang=…`. При подключении — снапшот
+последних 40 сегментов, дальше live. Смена языка сообщением `setlang`
+без переподключения.
 
-**Local venue loop:** `ws://<edge>:8788`—same message format,
-works without an internet connection.
+**Локальный контур площадки:** `ws://<edge>:8788` — тот же формат сообщений,
+работает при отсутствии интернета.
 
 | REST | |
 |---|---|
-| `GET /api/talks` | list of talks |
-| `GET /api/talks/{id}/transcript?lang=` | transcript, optionally translated |
-| `GET/POST /api/talks/{id}/summary` | get / regenerate summary |
-| `POST /api/talks/{id}/control` | `mute` (mute) · `unmute` · `end` |
-| `POST /api/talks/{id}/segments/{sid}` | edit text → new revision sent to clients |
-| `GET /api/talks/{id}/stats` | delay, uplink status, listeners by language, MT usage |
+| `GET /api/talks` | список докладов |
+| `GET /api/talks/{id}/transcript?lang=` | стенограмма, опционально переведённая |
+| `GET/POST /api/talks/{id}/summary` | получить / пересобрать саммари |
+| `POST /api/talks/{id}/control` | `mute` (стоп-кран) · `unmute` · `end` |
+| `POST /api/talks/{id}/segments/{sid}` | правка текста → новая ревизия клиентам |
+| `GET /api/talks/{id}/stats` | задержка, состояние аплинка, слушатели по языкам, расход MT |
 
-The mute and edit features arose not from the initial requirements but from operational needs:
-the platform needed a way to instantly mute subtitles when something was said
-that shouldn’t be recorded.
+Стоп-кран и правка появились не из постановки задачи, а из эксплуатации:
+на площадке нужен способ мгновенно погасить субтитры, когда прозвучало то,
+что не должно быть записано.
 
-## Deployment
+## Запуск
 
 ```bash
-# cloud
+# облако
 pip install -r requirements-cloud.txt
 cd cloud && uvicorn app:app --port 8000
 
-# venue agent (requires a GPU)
-pip install -r requirements-edge.txt   # uncomment production dependencies
+# агент площадки (нужен GPU)
+pip install -r requirements-edge.txt   # раскомментировать боевые зависимости
 cd edge && python run_edge.py --config config.venue.yaml
 ```
 
-MT keys and summaries are passed via environment variables (`DEEPL_KEY` or `OPENAI_API_KEY`).
-Without ingest keys, storage and distribution work, but translation is disabled,
-and summaries are generated by extracting fragments.
+Ключи MT и саммари — через окружение (`DEEPL_KEY` либо `OPENAI_API_KEY`).
+Без ключей ingest, хранилище и раздача работают, перевод отключается,
+саммари собирается извлечением фрагментов.
 
-## Limitations
+## Тесты
 
-- **Overlapping speech** is not handled by online diarization. This can only be resolved using separate
-  channels controlled via remote—this is an organizational requirement for the venue, not an ML task.
-- **Automatic language detection** is risky during code-switching (“Russian with English
-  terms”); in the production profile, the language is specified in advance.
-- **Summaries are marked as drafts.** The LLM hallucinates numbers; the prompt includes an explicit
-  prohibition, but an operator must review them before publication. Currently, they are published
-  automatically—a deliberate simplification.
-- **Partial multi-tenancy.** `talk_id` is used everywhere, but the session registry
-  is single-level and pub/sub is in-process. For multiple parallel rooms, an
-  external broker is required; the `bus.py` interface intentionally matches NATS/Redis Streams,
-  making replacement straightforward.
-- **Not implemented:** offline transcript annotation after a talk for archiving,
-  audience authorization, recording retention policy, and speaker consent.
+```bash
+cd tests && python test_floor.py && python test_timebase.py
+```
 
-## Structure
+Синтетические сцены на условиях, где ломается наивная реализация: разница
+гейна 12 dB между микрофонами, просочка -18 dB во все каналы, микропаузы
+между словами, выключенный канал, два независимых голоса одновременно.
+Второй файл проверяет перевод между шкалами времени и то, что дискриминатор
+просочки не вырожден (различает оба случая, а не всегда отвечает одинаково).
+
+## Ограничения
+
+- **Наложение речи** разбирается только фактом обнаружения: система помечает
+  сегмент флагом overlap, но не разделяет два голоса в один транскрипт.
+  На суммарном миксе (`embed`) не обнаруживается и это.
+- **Автодетект языка** рискован при code-switching («русский с английскими
+  терминами»); в боевом профиле язык задаётся заранее.
+- **Саммари помечено черновиком.** LLM галлюцинирует цифры; в промпте прямой
+  запрет, но перед публикацией нужен просмотр оператором. Сейчас публикуется
+  автоматически — сознательное упрощение.
+- **Мультитенантность частичная.** `talk_id` протянут везде, но реестр сессий
+  одноуровневый и pub/sub in-process. Для нескольких параллельных залов нужен
+  внешний брокер; интерфейс `bus.py` намеренно совпадает с NATS/Redis Streams,
+  замена механическая.
+- **Не сделано:** оффлайн-переразметка транскрипта после доклада для архива,
+  авторизация зрителей, политика хранения записей и согласия спикеров.
+
+## Структура
 
 ```
-edge/       venue agent
-  asr.py          faster-whisper + LocalAgreement + hallucination filters
-  segmenter.py    stream segmentation, closure policy
-  diarize.py      channel / embed, enrollment, audio ring buffer
-  audio.py        capture from the console, VAD gate
-  uplink.py       store-and-forward over an unreliable channel
-  run_edge.py     main loop + local socket for the hall screen
-cloud/      cloud component
-  app.py          ingest, fan-out, REST, commands to the venue
-  bus.py          pub/sub + active language registry
-  store.py        SQLite, deduplication by (sid, rev)
-  translate.py    lazy MT, cache, glossary
-  summarize.py    map-reduce summaries
-PROTOCOL.md   message format and delivery guarantees
+edge/       агент площадки
+  channels.py     кто держит слово: шумовой пол на канал, просочка, гистерезис
+  timebase.py     перевод между часами ASR (только речь) и временем доклада
+  asr.py          faster-whisper + LocalAgreement + фильтры галлюцинаций
+  segmenter.py    нарезка потока на сегменты, политика закрытия
+  diarize.py      channel / embed, энроллмент, кольцевая лента аудио
+  audio.py        захват с пульта, VAD-гейт
+  uplink.py       store-and-forward через ненадёжный канал
+  run_edge.py     главный цикл + локальный сокет для экрана зала
+cloud/      облачная часть
+  app.py          ingest, fan-out, REST, команды на площадку
+  bus.py          pub/sub + реестр активных языков
+  store.py        SQLite, дедупликация по (sid, rev)
+  translate.py    ленивый MT, кэш, глоссарий
+  summarize.py    map-reduce саммари
+PROTOCOL.md   формат сообщений и гарантии доставки
 ```

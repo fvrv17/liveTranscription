@@ -1,10 +1,10 @@
 """
-Audio capture and VAD gate.
+Захват звука и VAD-гейт.
 
-The VAD should be placed BEFORE the ASR, not inside it: silence must not be fed to Whisper,
-otherwise it will generate fake subtitles (“Subtitles by ...”) directly on the screen in the theater.
-Silero, if installed; otherwise, use an energy gate with hysteresis,
-which is sufficient for the prototype.
+VAD стоит ДО ASR, а не внутри него: тишину нельзя отдавать Whisper,
+иначе он галлюцинирует титры («Субтитры сделал ...») прямо на экран в зале.
+Silero, если установлен; иначе — энергетический гейт с гистерезисом,
+которого для прототипа достаточно.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import numpy as np
 
 log = logging.getLogger("audio")
 SAMPLE_RATE = 16000
-FRAME = 512          # 32 ms
+FRAME = 512          # 32 мс
 
 
 class VAD:
@@ -44,7 +44,7 @@ class VAD:
             db = 20 * np.log10(rms)
             active = db > self.cfg.vad_energy_db
 
-            # Hysteresis: Don't break up the phrase with short pauses between words
+        # гистерезис: не рвём фразу на коротких паузах между словами
         if active:
             self.speech = True
             self.hang = int(self.cfg.vad_hangover_sec * SAMPLE_RATE / FRAME)
@@ -56,8 +56,8 @@ class VAD:
 
 
 class MicSource:
-    """Audio capture from device. On the stage — line input from the mixing console,
-    not the laptop microphone."""
+    """Захват с устройства. На площадке — линейный вход с микшерного пульта,
+    а не микрофон ноутбука."""
 
     def __init__(self, device=None, channels: int = 1):
         import sounddevice as sd
@@ -85,12 +85,14 @@ class MicSource:
         self.stream.close()
 
     def read(self) -> np.ndarray:
+        """Возвращает (кадры, каналы). Схлопывать в моно здесь нельзя:
+        именно из разницы между каналами и определяется говорящий."""
         block = self.q.get()
-        return block.mean(axis=1) if block.ndim > 1 else block
+        return block if block.ndim > 1 else block.reshape(-1, 1)
 
 
 class FileSource:
-    """Playback of WAV files in real-time — for testing and demos."""
+    """Проигрывание WAV в реальном времени — для тестов и демо."""
 
     def __init__(self, path: str):
         self.wav = wave.open(path, "rb")
@@ -107,4 +109,4 @@ class FileSource:
         if not data:
             raise EOFError
         a = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-        return a.reshape(-1, self.ch).mean(axis=1) if self.ch > 1 else a
+        return a.reshape(-1, self.ch)

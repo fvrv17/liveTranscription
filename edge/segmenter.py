@@ -75,10 +75,18 @@ class Segmenter:
         self._sid = 0
         self.open: Segment | None = None
         self.last_word_end: float | None = None
+        self.speaker: str | None = None      # канальный режим знает его синхронно
 
     def _new(self) -> Segment:
         self._sid += 1
-        return Segment(sid=self._sid)
+        return Segment(sid=self._sid, spk=self.speaker,
+                       spk_conf=1.0 if self.speaker else 0.0)
+
+    def set_speaker(self, name: str | None) -> None:
+        """Смена владельца слова. Вызывать ПОСЛЕ flush(): границу сегмента
+        задаёт сам факт смены говорящего."""
+        self.speaker = name
+        self.last_word_end = None            # пауза на переходе не должна дробить
 
     # -- вход ----------------------------------------------------------------
     def push_stable(self, words: list[Word]) -> list[SegEvent]:
