@@ -1,0 +1,32 @@
+name: tests
+
+# Здесь нет ни torch, ни GPU, ни скачивания моделей — и это условие, а не
+# экономия. Диаризация проверяется подменным энкодером (eval/stub_encoder.py):
+# ломается в ней не модель, а нарезка, отбор речи и кластеризация, и они
+# ошибаются одинаково независимо от того, кто считает вектор.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "numpy>=1.24" PyYAML
+
+      - name: детектор владения словом
+        run: python tests/test_floor.py
+      - name: шкалы времени
+        run: python tests/test_timebase.py
+      - name: диаризация
+        run: python tests/test_diarize.py
+
+      # Падает, если DER ухудшился больше чем на допуск из baseline.json.
+      - name: eval диаризации
+        run: python eval/run_eval.py

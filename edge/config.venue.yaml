@@ -36,7 +36,12 @@ max_segment_sec: 3.5
 diarize_mode: channel
 diarize_channels: {0: "Мария Петрова", 1: "Иван Соколов", 2: "Модератор"}
 diarize_enroll_dir: "./enroll"     # 10-секундные wav с саундчека, имя файла = имя спикера
-diarize_threshold: 0.68
+diarize_threshold: 0.68            # косинус ECAPA: свой голос ~0.7-0.8, чужой ~0.2-0.4
+
+# Ниже — только для diarize_mode: embed. Остальные ручки в edge/config.py.
+diarize_min_conf: 0.45             # ниже => spk: null. Чужая фамилия хуже пустой подписи
+diarize_refine: true               # переразметить доклад в конце и разослать ревизии
+diarize_refine_threshold: 0.35     # косинусное РАССТОЯНИЕ остановки кластеризации
 
 cloud_ws: "wss://captions.example.com/ws/ingest"
 token: "${INGEST_TOKEN}"

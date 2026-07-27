@@ -128,6 +128,10 @@ class Edge:
         self.diar_q: asyncio.Queue = asyncio.Queue()
         self.samples = 0                 # абсолютный счётчик, задаёт шкалу времени доклада
         self.lag_ms = 0.0
+        # Закрытые сегменты: sid -> {rev, spk}. Нужен, чтобы задним числом
+        # переименовать спикера — при склейке кластеров и после офлайн-прохода.
+        # Держим только версию и метку, тексты живут у клиента.
+        self.sent: dict[int, dict] = {}
 
     # -- команды оператора ---------------------------------------------------
     async def on_control(self, msg: dict) -> None:
@@ -170,21 +174,77 @@ class Edge:
             # наружу — абсолютное время доклада, а не часы ASR (см. timebase.py)
             "t0": round(t0_abs, 2), "t1": round(t1_abs, 2),
         })
+        if s.final:
+            self.sent[s.sid] = {"rev": s.rev, "spk": s.spk, "conf": s.spk_conf}
         # в канальном режиме спикер уже проставлен синхронно, догонять нечего
         if s.final and self.cfg.diarize_mode == "embed":
-            await self.diar_q.put((s, t0_abs, t1_abs))
+            await self.diar_q.put((s.sid, t0_abs, t1_abs))
 
     # -- диаризация вне критического пути ------------------------------------
+    async def revise_speaker(self, sid: int, spk: str | None, conf: float, src: str) -> None:
+        """Поздняя правка метки. Ревизия того же sid, а не новый сегмент:
+        клиент делает upsert по sid и просто перерисует подпись (PROTOCOL.md)."""
+        rec = self.sent.get(sid)
+        if rec is None or rec["spk"] == spk:
+            return
+        rec["rev"] += 1
+        rec["spk"] = spk
+        rec["conf"] = conf
+        await self.emit({"t": "spk", "sid": sid, "rev": rec["rev"],
+                         "spk": spk, "spk_conf": round(conf, 2), "src": src})
+
     async def diarizer(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
-            s, t0_abs, t1_abs = await self.diar_q.get()
-            audio = self.tape.slice(t0_abs, t1_abs)     # лента живёт в абсолютном времени
-            guess = await loop.run_in_executor(None, self.router.assign, audio)
-            if guess.spk and guess.spk != s.spk:
-                s.spk, s.spk_conf, s.rev = guess.spk, guess.conf, s.rev + 1
-                await self.emit({"t": "spk", "sid": s.sid, "rev": s.rev,
-                                 "spk": guess.spk, "spk_conf": round(guess.conf, 2)})
+            sid, t0_abs, t1_abs = await self.diar_q.get()
+            try:
+                audio = self.tape.slice(t0_abs, t1_abs)  # лента живёт в абсолютном времени
+                guess = await loop.run_in_executor(None, self.router.assign, sid, audio, t0_abs)
+                if guess.spk:
+                    await self.revise_speaker(sid, guess.spk, guess.conf, "online")
+                if guess.change_at is not None:
+                    # Текст задним числом не режем: sid'ы монотонные, между ними
+                    # не вставить. Отдаём момент смены — архив и оператор разберут.
+                    log.warning("сегмент %d содержит смену голоса на %.2f c", sid, guess.change_at)
+                    await self.emit({"t": "spk_change", "sid": sid, "at": guess.change_at})
+                # Кластеры, оказавшиеся одним человеком: чиним всю их историю.
+                for old, new in self.router.take_merges().items():
+                    for s_id, rec in self.sent.items():
+                        if rec["spk"] == old:
+                            await self.revise_speaker(s_id, new, rec["conf"], "merge")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Диаризация — не критический путь, и умереть целиком она не
+                # имеет права: сегмент уже в зале, просто останется без подписи.
+                # Без этого одно исключение оставляло доклад без меток до конца,
+                # причём молча — очередь продолжала расти.
+                log.exception("диаризация упала на сегменте %d: %s", sid, exc)
+            finally:
+                self.diar_q.task_done()
+
+    async def drain_diarizer(self) -> None:
+        """Дождаться, пока разберут очередь. Офлайн-проход обязан видеть
+        последние сегменты — иначе он пересоберёт кластеры без них."""
+        try:
+            await asyncio.wait_for(self.diar_q.join(), timeout=15.0)
+        except asyncio.TimeoutError:
+            log.warning("диаризация не успела разобрать очередь (%d в хвосте)", self.diar_q.qsize())
+
+    async def refine_speakers(self) -> None:
+        """Офлайн-проход в конце доклада. Онлайн решал за 200 мс по первым
+        секундам голоса; здесь виден весь доклад целиком, и ранние ошибки —
+        лишний кластер, приклеенный чужой голос — наконец видно и можно снять."""
+        if not (self.cfg.diarize_refine and self.cfg.diarize_mode == "embed"):
+            return
+        loop = asyncio.get_running_loop()
+        fixes = await loop.run_in_executor(None, self.router.refine)
+        if not fixes:
+            log.info("офлайн-проход: расхождений с онлайном нет")
+            return
+        log.info("офлайн-проход: переразмечено %d сегментов из %d", len(fixes), len(self.sent))
+        for sid, g in sorted(fixes.items()):
+            await self.revise_speaker(sid, g.spk, g.conf, "refine")
 
     # -- смена владельца слова -----------------------------------------------
     async def on_floor(self, ev) -> None:
@@ -290,7 +350,8 @@ class Edge:
         ev = self.seg.flush()
         if ev:
             await self.emit_seg(ev)
-        await asyncio.sleep(1.0)                     # дать диаризации доехать
+        await self.drain_diarizer()
+        await self.refine_speakers()
         await self.emit({"t": "talk", "state": "ended"})
         await asyncio.sleep(2.0)                     # дать аплинку слить буфер
         log.info("доклад завершён")

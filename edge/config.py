@@ -64,9 +64,35 @@ class Config:
     # --- диаризация ---
     diarize_mode: str = "off"            # off | channel | embed
     diarize_channels: dict = field(default_factory=dict)   # {"0":"Мария","1":"Иван"}
-    diarize_threshold: float = 0.68
+    diarize_threshold: float = 0.68      # косинус, выше которого считаем «тот же голос»
     diarize_max_speakers: int = 8
     diarize_enroll_dir: str = ""
+    diarize_encoder: str = "ecapa"       # см. encoders.py; eval подставляет свой
+    diarize_model_dir: str = "/tmp/ecapa"
+
+    # окно эмбеддинга. Короче 1 с ECAPA неустойчива, длиннее 2 с — окно
+    # начинает захватывать двух говорящих сразу и смена голоса размазывается.
+    diarize_window_sec: float = 1.5
+    diarize_hop_sec: float = 0.75
+    diarize_min_voiced_sec: float = 0.6  # РЕЧИ в окне после выброса пауз
+    diarize_voiced_range_db: float = 35.0    # ниже максимума этого куска => пауза
+    diarize_voiced_floor_db: float = -55.0   # абсолютный пол, страховка от пустого куска
+
+    # уверенность и её пороги
+    diarize_conf_temp: float = 0.06      # мягкость шкалы conf; меньше => резче
+    diarize_margin_ref: float = 0.08     # отрыв от второго места, ниже которого метка спорна
+    diarize_new_conf_cap: float = 0.60   # потолок для кластера с одним наблюдением
+    diarize_min_conf: float = 0.45       # ниже => spk=null, чужое имя хуже пустого
+    diarize_mixed_penalty: float = 0.60  # множитель, если в сегменте сменился голос
+
+    # адаптация и склейка
+    diarize_adapt_window: int = 20       # пол на скорость обучения центроида
+    diarize_merge_threshold: float = 0.82    # ВЫШЕ порога назначения, см. merge_pass
+    diarize_merge_every: int = 10        # склейку гоняем раз в N сегментов
+
+    # офлайн-перекластеризация в конце доклада
+    diarize_refine: bool = True
+    diarize_refine_threshold: float = 0.35   # косинусное РАССТОЯНИЕ остановки
 
     # --- сеть ---
     cloud_ws: str = "ws://localhost:8000/ws/ingest"
